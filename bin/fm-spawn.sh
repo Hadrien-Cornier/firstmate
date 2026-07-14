@@ -649,6 +649,20 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+# Absolute (physical) git common-dir for a path, empty when the path is not a
+# git repository. A linked worktree's common-dir points back at the repository's
+# main worktree (the .git the worktrees were created from), so two worktrees of
+# the SAME repo share one absolute common-dir while an unrelated repo's is
+# different. Used to require that a captured pane cwd belongs to the PROJECT's
+# own repository, not a transient shell-startup cwd in some other git repo
+# (the oh-my-zsh `cd "$ZSH"` into ~/.oh-my-zsh incident).
+abs_common_dir() {  # <path>
+  local path=$1 c
+  c=$(git -C "$path" rev-parse --git-common-dir 2>/dev/null) || return 1
+  ( cd "$path" 2>/dev/null && cd "$c" 2>/dev/null && pwd -P )
+}
+PROJ_COMMON=$(abs_common_dir "$PROJ_ABS" 2>/dev/null || true)
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -658,7 +672,7 @@ real_path_or_raw() {  # <path>
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real wt_common
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -669,8 +683,12 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
     wt_top_real=
   fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
-    echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+  # Defense in depth: the candidate must also belong to the PROJECT's own repo,
+  # so a captured-but-unrelated repo (or a subdirectory, symlink back to the
+  # primary, or any non-worktree path) cannot slip past the toplevel check.
+  wt_common=$(abs_common_dir "$WT" 2>/dev/null || true)
+  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ] || [ -z "$wt_common" ] || [ -z "$PROJ_COMMON" ] || [ "$wt_common" != "$PROJ_COMMON" ]; then
+    echo "error: $source did not yield an isolated project worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
@@ -807,20 +825,58 @@ spawn_send_key() {  # <target> <key>
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   spawn_send_text_line "$T" 'treehouse get'
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
+  # Wait for the treehouse subshell: the pane's cwd moves from the project to a
+  # worktree OF THE PROJECT'S REPO. A project worktree (matching git common-dir)
+  # is captured on sight. An UNRELATED git repo is skipped: it is a transient
+  # shell cwd - e.g. oh-my-zsh's startup `cd "$ZSH"` into ~/.oh-my-zsh - that
+  # differs from PROJ_ABS but is a different repository, so we keep waiting for
+  # the real project worktree. A plain non-git directory is a genuine treehouse
+  # misfire we want to fast-fail on, BUT shell startup can also cd through a
+  # non-git dir transiently (e.g. `cd ~` when $HOME is not a repo), so we require
+  # the SAME non-git path to persist across NONGIT_THRESHOLD consecutive polls
+  # before capturing it; only then do we let the isolation guard reject it at
+  # once rather than hanging the full timeout. A one-poll transient never
+  # survives. Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked
+  # project prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
+  NONGIT_THRESHOLD=3
+  nongit_path=
+  nongit_count=0
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$T" || true)
     if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
-      break
+      cand_common=$(abs_common_dir "$p" 2>/dev/null || true)
+      if [ -n "$cand_common" ]; then
+        if [ -n "$PROJ_COMMON" ] && [ "$cand_common" = "$PROJ_COMMON" ]; then
+          WT="$p"
+          break
+        fi
+        # An unrelated git repo (a transient cwd); keep waiting.
+        nongit_path=
+        nongit_count=0
+      else
+        # Non-git directory: could be a genuine misfire or a transient startup
+        # cwd. Only capture once the same path persists across NONGIT_THRESHOLD
+        # polls.
+        if [ "$(real_path_or_raw "$p")" = "$nongit_path" ]; then
+          nongit_count=$((nongit_count + 1))
+        else
+          nongit_path=$(real_path_or_raw "$p")
+          nongit_count=1
+        fi
+        if [ "$nongit_count" -ge "$NONGIT_THRESHOLD" ]; then
+          WT="$p"
+          break
+        fi
+      fi
+    else
+      nongit_path=
+      nongit_count=0
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter a project worktree within 60s; inspect window $T" >&2
     exit 1
   fi
 
