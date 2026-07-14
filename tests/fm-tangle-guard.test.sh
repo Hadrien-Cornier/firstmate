@@ -151,7 +151,9 @@ test_brief_assertion_precedes_branch() {
 
 # A fake tmux that reports FM_FAKE_PANE_PATH as the post-`treehouse get` pane cwd
 # (so the spawn's worktree-resolution loop resolves to a path we control), names
-# the session on '#S', and swallows window ops. Echoes the fakebin dir.
+# the session on '#S', and swallows window ops. With FM_FAKE_PANE_SEQ set to a
+# file of one path per line, each pane_current_path query advances through that
+# sequence (exhausts to FM_FAKE_PANE_PATH). Echoes the fakebin dir.
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -159,7 +161,23 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    if [ -n "${FM_FAKE_PANE_SEQ:-}" ] && [ -f "${FM_FAKE_PANE_SEQ:-}" ]; then
+      posf="${FM_FAKE_PANE_SEQ}.pos"
+      n=$(cat "$posf" 2>/dev/null || echo 0)
+      n=$((n + 1))
+      printf '%s\n' "$n" > "$posf"
+      line=$(sed -n "${n}p" "$FM_FAKE_PANE_SEQ" 2>/dev/null || true)
+      if [ -n "$line" ]; then
+        printf '%s\n' "$line"
+      else
+        printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+      fi
+      exit 0
+    fi
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
@@ -173,10 +191,21 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# When FM_SPAWN_FAKE_SLEEP=1 is set for a case, shadow sleep with a no-op so a
+# full 60-iteration hang finishes in ms (used for unrelated-git timeout).
 run_spawn() {
   local home=$1 id=$2 proj=$3 pane=$4 fakebin=$5
   mkdir -p "$home/data/$id"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  if [ -n "${FM_SPAWN_FAKE_SLEEP:-}" ]; then
+    cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    chmod +x "$fakebin/sleep"
+  else
+    rm -f "$fakebin/sleep"
+  fi
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
@@ -196,22 +225,112 @@ test_spawn_isolation_abort() {
   mkdir -p "$TMP_ROOT/spawn-notgit" "$proj/sub"
 
   # Abort: the pane resolves to a plain non-git directory (not a worktree at all).
+  # Also pin fast-fail: a persistent non-git misfire must trip the isolation guard
+  # in a few seconds, not spin the full 60s timeout with the wrong message.
+  SECONDS=0
   out=$(run_spawn "$home" abort-notgit-dd4 "$proj" "$TMP_ROOT/spawn-notgit" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn into a non-worktree dir should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "non-worktree spawn lacked the isolation error"
+  assert_contains "$out" "did not yield an isolated project worktree" "non-worktree spawn lacked the isolation error"
+  assert_not_contains "$out" "did not enter a project worktree within 60s" "non-git misfire must not report the 60s timeout"
   assert_absent "$home/state/abort-notgit-dd4.meta" "aborted spawn must not record meta"
+  [ "$SECONDS" -lt 15 ] || fail "non-git misfire took ${SECONDS}s; expected isolation abort well under 15s"
 
   # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS).
   out=$(run_spawn "$home" abort-primary-ee5 "$proj" "$proj/sub" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn landing inside the primary checkout should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "primary-checkout spawn lacked the isolation error"
+  assert_contains "$out" "did not yield an isolated project worktree" "primary-checkout spawn lacked the isolation error"
 
   # Proceed: the pane resolves to a genuine, isolated worktree.
   out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/spawn-wt" "$fakebin"); status=$?
   expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
   assert_contains "$out" "spawned ok-isolated-ff6" "isolated spawn did not report success"
-  assert_not_contains "$out" "did not yield an isolated worktree" "isolated spawn wrongly tripped the guard"
+  assert_not_contains "$out" "did not yield an isolated project worktree" "isolated spawn wrongly tripped the guard"
   pass "fm-spawn: aborts unless the resolved worktree is a genuine, isolated worktree"
+}
+
+# Capture-loop semantics for non-git misfires vs unrelated/transient cwd noise.
+# Complements the isolation-abort cases above with the three modes the loop
+# must distinguish: unrelated git repo, transient non-git cwd, persistent non-git.
+test_spawn_capture_loop_modes() {
+  local home proj fakebin out status other seqf
+  home="$TMP_ROOT/spawn-capture-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/spawn-capture-proj")
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-capture-fake")
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-capture-wt" >/dev/null 2>&1
+  mkdir -p "$TMP_ROOT/spawn-capture-notgit"
+  other=$(make_repo "$TMP_ROOT/spawn-capture-other")
+
+  # Unrelated git repo (e.g. oh-my-zsh's startup cd): keep waiting, then the true
+  # 60s timeout - never the isolation guard (isolation only runs after capture).
+  # Shadow sleep so the 60 iterations finish instantly.
+  FM_SPAWN_FAKE_SLEEP=1
+  out=$(run_spawn "$home" abort-unrelated-gg7 "$proj" "$other" "$fakebin"); status=$?
+  unset FM_SPAWN_FAKE_SLEEP
+  expect_code 1 "$status" "unrelated git cwd should time out, not launch"
+  assert_contains "$out" "did not enter a project worktree within 60s" "unrelated git cwd lacked the 60s timeout"
+  assert_not_contains "$out" "did not yield an isolated project worktree" "unrelated git cwd must not trip isolation"
+  assert_absent "$home/state/abort-unrelated-gg7.meta" "unrelated-git timeout must not record meta"
+
+  # Transient non-git (below NONGIT_THRESHOLD=3 consecutive polls) then a real
+  # project worktree: must NOT misfire-abort; capture the worktree and launch.
+  seqf="$TMP_ROOT/spawn-capture-seq-transient"
+  {
+    printf '%s\n' "$TMP_ROOT/spawn-capture-notgit"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-notgit"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-wt"
+  } > "$seqf"
+  rm -f "$seqf.pos"
+  out=$(
+    FM_FAKE_PANE_SEQ="$seqf" \
+      run_spawn "$home" ok-transient-hh8 "$proj" "$TMP_ROOT/spawn-capture-wt" "$fakebin"
+  ); status=$?
+  expect_code 0 "$status" "two transient non-git polls then a real worktree should succeed"
+  assert_contains "$out" "spawned ok-transient-hh8" "transient non-git then worktree did not report success"
+  assert_not_contains "$out" "did not yield an isolated project worktree" "transient non-git wrongly tripped isolation"
+
+  # Persistent non-git for NONGIT_THRESHOLD polls, even if a real worktree follows
+  # later: capture the misfire and abort on isolation (never wait for a late WT).
+  seqf="$TMP_ROOT/spawn-capture-seq-persist"
+  {
+    printf '%s\n' "$TMP_ROOT/spawn-capture-notgit"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-notgit"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-notgit"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-wt"
+  } > "$seqf"
+  rm -f "$seqf.pos"
+  out=$(
+    FM_FAKE_PANE_SEQ="$seqf" \
+      run_spawn "$home" abort-persist-ii9 "$proj" "$TMP_ROOT/spawn-capture-wt" "$fakebin"
+  ); status=$?
+  expect_code 1 "$status" "three consecutive non-git polls should capture and isolation-abort"
+  assert_contains "$out" "did not yield an isolated project worktree" "persistent non-git lacked isolation abort"
+  assert_not_contains "$out" "did not enter a project worktree within 60s" "persistent non-git must not report the 60s timeout"
+  # The incident: an UNRELATED git repo appears first (oh-my-zsh's startup
+  # `cd "$ZSH"` into ~/.oh-my-zsh), then the real project worktree appears.
+  # Pre-fix the unrelated repo won the capture and launched in the wrong repo.
+  # Post-fix the unrelated-repo transient loses the race and the genuine worktree
+  # is captured on sight; its path is what meta records, never the unrelated repo.
+  seqf="$TMP_ROOT/spawn-capture-seq-incident"
+  {
+    printf '%s\n' "$other"
+    printf '%s\n' "$other"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-wt"
+  } > "$seqf"
+  rm -f "$seqf.pos"
+  out=$(
+    FM_FAKE_PANE_SEQ="$seqf" \
+      run_spawn "$home" ok-incident-jj1 "$proj" "$TMP_ROOT/spawn-capture-wt" "$fakebin"
+  ); status=$?
+  expect_code 0 "$status" "unrelated-repo transient then a real worktree should succeed, not launch in the unrelated repo"
+  assert_contains "$out" "spawned ok-incident-jj1" "unrelated-repo-then-worktree did not report success"
+  assert_not_contains "$out" "did not yield an isolated project worktree" "unrelated-repo-then-worktree wrongly tripped isolation"
+  assert_present "$home/state/ok-incident-jj1.meta" "incident sequence must record meta"
+  assert_grep "worktree=$TMP_ROOT/spawn-capture-wt" "$home/state/ok-incident-jj1.meta" \
+    "incident meta must record the real project worktree, not the unrelated repo"
+  assert_no_grep "worktree=$other" "$home/state/ok-incident-jj1.meta" \
+    "incident meta must never record the unrelated repo path"
+  pass "fm-spawn: capture loop distinguishes non-git misfire, unrelated git, and transient cwd"
 }
 
 test_lib_classification
@@ -219,3 +338,4 @@ test_guard_banner
 test_bootstrap_line
 test_brief_assertion_precedes_branch
 test_spawn_isolation_abort
+test_spawn_capture_loop_modes

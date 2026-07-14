@@ -571,7 +571,7 @@ test_spawn_refuses_orca_nonisolated_worktree() {
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
   expect_code 1 "$status" "fm-spawn.sh --backend orca should refuse a primary checkout worktree"
-  assert_contains "$out" "orca worktree create did not yield an isolated worktree" \
+  assert_contains "$out" "orca worktree create did not yield an isolated project worktree" \
     "Orca spawn should reuse the isolated-worktree guard"
   assert_absent "$state/$id.meta" "aborted Orca spawn must not record meta"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create' \
