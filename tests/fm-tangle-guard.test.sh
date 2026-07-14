@@ -306,6 +306,30 @@ test_spawn_capture_loop_modes() {
   expect_code 1 "$status" "three consecutive non-git polls should capture and isolation-abort"
   assert_contains "$out" "did not yield an isolated project worktree" "persistent non-git lacked isolation abort"
   assert_not_contains "$out" "did not enter a project worktree within 60s" "persistent non-git must not report the 60s timeout"
+  # The incident: an UNRELATED git repo appears first (oh-my-zsh's startup
+  # `cd "$ZSH"` into ~/.oh-my-zsh), then the real project worktree appears.
+  # Pre-fix the unrelated repo won the capture and launched in the wrong repo.
+  # Post-fix the unrelated-repo transient loses the race and the genuine worktree
+  # is captured on sight; its path is what meta records, never the unrelated repo.
+  seqf="$TMP_ROOT/spawn-capture-seq-incident"
+  {
+    printf '%s\n' "$other"
+    printf '%s\n' "$other"
+    printf '%s\n' "$TMP_ROOT/spawn-capture-wt"
+  } > "$seqf"
+  rm -f "$seqf.pos"
+  out=$(
+    FM_FAKE_PANE_SEQ="$seqf" \
+      run_spawn "$home" ok-incident-jj1 "$proj" "$TMP_ROOT/spawn-capture-wt" "$fakebin"
+  ); status=$?
+  expect_code 0 "$status" "unrelated-repo transient then a real worktree should succeed, not launch in the unrelated repo"
+  assert_contains "$out" "spawned ok-incident-jj1" "unrelated-repo-then-worktree did not report success"
+  assert_not_contains "$out" "did not yield an isolated project worktree" "unrelated-repo-then-worktree wrongly tripped isolation"
+  assert_present "$home/state/ok-incident-jj1.meta" "incident sequence must record meta"
+  assert_grep "worktree=$TMP_ROOT/spawn-capture-wt" "$home/state/ok-incident-jj1.meta" \
+    "incident meta must record the real project worktree, not the unrelated repo"
+  assert_no_grep "worktree=$other" "$home/state/ok-incident-jj1.meta" \
+    "incident meta must never record the unrelated repo path"
   pass "fm-spawn: capture loop distinguishes non-git misfire, unrelated git, and transient cwd"
 }
 
